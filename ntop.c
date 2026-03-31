@@ -41,6 +41,7 @@
 #define CARET_INTERVAL 500
 #define MAX_NAMEPARTS 10
 #define MAX_NAMEPARTSIZE 255
+#define MAX_COMMANDLINE 4096
 
 static int Width;
 static int Height;
@@ -63,11 +64,19 @@ static int ConPrintf(TCHAR *Fmt, ...)
 	va_list VaList;
 
 	va_start(VaList, Fmt);
-	int CharsWritten = _vstprintf_s(Buffer, _countof(Buffer), Fmt, VaList);
+	int CharsWritten = _vsntprintf_s(Buffer, _countof(Buffer), _TRUNCATE, Fmt, VaList);
 	va_end(VaList);
 
+	if(CharsWritten < 0) {
+		CharsWritten = (int)_tcsnlen(Buffer, _countof(Buffer));
+	}
+
+	if(CharsWritten <= 0) {
+		return 0;
+	}
+
 	DWORD Dummy;
-	WriteFile(ConsoleHandle, Buffer, CharsWritten, &Dummy, 0);
+	WriteFile(ConsoleHandle, Buffer, (DWORD)CharsWritten, &Dummy, 0);
 
 	return CharsWritten;
 }
@@ -241,6 +250,7 @@ typedef struct process {
 	DWORD ThreadCount;
 	ULONGLONG UpTime;
 	TCHAR ExeName[MAX_PATH];
+	TCHAR CommandLine[MAX_COMMANDLINE];
 	DWORD ParentPID;
 	ULONGLONG DiskOperationsPrev;
 	ULONGLONG DiskOperations;
@@ -303,6 +313,8 @@ static DWORD RunningProcessCount = 0;
 static DWORD ProcessIndex = 0;
 static DWORD SelectedProcessIndex = 0;
 static DWORD SelectedProcessID = 0;
+static BOOL ShowFullCommandLine = FALSE;
+static DWORD HorizontalScrollOffset = 0;
 static BOOL FollowProcess = FALSE;
 static DWORD FollowProcessID = 0;
 
@@ -566,6 +578,137 @@ static TCHAR SearchPattern[256];
 static BOOLEAN CaseInsensitiveSearch = FALSE;
 static BOOLEAN SearchActive;
 
+typedef LONG NTSTATUS;
+
+typedef struct _PROCESS_BASIC_INFORMATION_LOCAL {
+	PVOID Reserved1;
+	PVOID PebBaseAddress;
+	PVOID Reserved2[2];
+	ULONG_PTR UniqueProcessId;
+	PVOID Reserved3;
+} PROCESS_BASIC_INFORMATION_LOCAL;
+
+typedef struct _UNICODE_STRING_LOCAL {
+	USHORT Length;
+	USHORT MaximumLength;
+	PWSTR Buffer;
+} UNICODE_STRING_LOCAL;
+
+typedef struct _RTL_USER_PROCESS_PARAMETERS_LOCAL {
+	BYTE Reserved1[16];
+	PVOID Reserved2[10];
+	UNICODE_STRING_LOCAL ImagePathName;
+	UNICODE_STRING_LOCAL CommandLine;
+} RTL_USER_PROCESS_PARAMETERS_LOCAL;
+
+typedef struct _PEB_LOCAL {
+	BYTE Reserved1[2];
+	BYTE BeingDebugged;
+	BYTE Reserved2[1];
+	PVOID Reserved3[2];
+	PVOID Ldr;
+	RTL_USER_PROCESS_PARAMETERS_LOCAL *ProcessParameters;
+} PEB_LOCAL;
+
+typedef NTSTATUS (WINAPI *NtQueryInformationProcessFn)(
+	HANDLE ProcessHandle,
+	ULONG ProcessInformationClass,
+	PVOID ProcessInformation,
+	ULONG ProcessInformationLength,
+	PULONG ReturnLength
+);
+
+static BOOL TryGetProcessCommandLine(HANDLE ProcessHandle, TCHAR *Buffer, DWORD BufferCount)
+{
+	static NtQueryInformationProcessFn NtQueryInformationProcess = 0;
+	static BOOL NtQueryLoaded = FALSE;
+	const DWORD MaxCommandLineBytes = MAX_COMMANDLINE * sizeof(WCHAR);
+
+	Buffer[0] = _T('\0');
+
+	if(!NtQueryLoaded) {
+		HMODULE NtdllHandle = GetModuleHandle(_T("ntdll.dll"));
+		if(NtdllHandle) {
+			NtQueryInformationProcess = (NtQueryInformationProcessFn)GetProcAddress(NtdllHandle, "NtQueryInformationProcess");
+		}
+		NtQueryLoaded = TRUE;
+	}
+
+	if(!NtQueryInformationProcess) {
+		return FALSE;
+	}
+
+	PROCESS_BASIC_INFORMATION_LOCAL BasicInfo;
+	if(NtQueryInformationProcess(ProcessHandle, 0, &BasicInfo, sizeof(BasicInfo), 0) != 0) {
+		return FALSE;
+	}
+
+	PEB_LOCAL Peb;
+	SIZE_T BytesRead;
+	if(!ReadProcessMemory(ProcessHandle, BasicInfo.PebBaseAddress, &Peb, sizeof(Peb), &BytesRead) || BytesRead < sizeof(Peb)) {
+		return FALSE;
+	}
+
+	RTL_USER_PROCESS_PARAMETERS_LOCAL Params;
+	if(!ReadProcessMemory(ProcessHandle, Peb.ProcessParameters, &Params, sizeof(Params), &BytesRead) || BytesRead < sizeof(Params)) {
+		return FALSE;
+	}
+
+	if(!Params.CommandLine.Buffer || Params.CommandLine.Length == 0) {
+		return FALSE;
+	}
+
+	if(Params.CommandLine.MaximumLength < Params.CommandLine.Length) {
+		return FALSE;
+	}
+
+	if((Params.CommandLine.Length % sizeof(WCHAR)) != 0) {
+		return FALSE;
+	}
+
+	DWORD BytesToRead = Params.CommandLine.Length;
+	if(BytesToRead > MaxCommandLineBytes - sizeof(WCHAR)) {
+		BytesToRead = MaxCommandLineBytes - sizeof(WCHAR);
+	}
+
+	if(BytesToRead == 0) {
+		return FALSE;
+	}
+
+	DWORD WCharCount = (DWORD)(BytesToRead / sizeof(WCHAR));
+	WCHAR *CommandLineWide = xcalloc(WCharCount + 1, sizeof(*CommandLineWide));
+
+	if(!ReadProcessMemory(ProcessHandle, Params.CommandLine.Buffer, CommandLineWide, BytesToRead, &BytesRead) || BytesRead < BytesToRead) {
+		free(CommandLineWide);
+		return FALSE;
+	}
+
+	CommandLineWide[WCharCount] = L'\0';
+
+#ifdef UNICODE
+	_tcsncpy_s(Buffer, BufferCount, CommandLineWide, _TRUNCATE);
+#else
+	int ConvertedChars = WideCharToMultiByte(CP_ACP, 0, CommandLineWide, WCharCount, Buffer, (int)BufferCount - 1, 0, 0);
+	if(ConvertedChars <= 0) {
+		free(CommandLineWide);
+		Buffer[0] = _T('\0');
+		return FALSE;
+	}
+
+	Buffer[ConvertedChars] = _T('\0');
+#endif
+
+	free(CommandLineWide);
+
+	for(DWORD i = 0; Buffer[i] != _T('\0'); ++i) {
+		if(Buffer[i] == _T('\r') || Buffer[i] == _T('\n') || Buffer[i] == _T('\t')) {
+			Buffer[i] = _T(' ');
+		}
+	}
+
+	return Buffer[0] != _T('\0');
+}
+
 static void SearchNext(void);
 
 void StartSearch(const TCHAR *Pattern)
@@ -689,7 +832,7 @@ static void PollProcessList(DWORD UpdateTime)
 		_tcsncpy_s(Process.ExeName, MAX_PATH, Entry.szExeFile, MAX_PATH);
 		_tcsncpy_s(Process.UserName, UNLEN, _T("SYSTEM"), UNLEN);
 
-		Process.Handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, Entry.th32ProcessID);
+		Process.Handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ, FALSE, Entry.th32ProcessID);
 		if(Process.Handle) {
 			PROCESS_MEMORY_COUNTERS ProcMemCounters;
 			if(GetProcessMemoryInfo(Process.Handle, &ProcMemCounters, sizeof(ProcMemCounters))) {
@@ -719,6 +862,8 @@ static void PollProcessList(DWORD UpdateTime)
 				}
 				CloseHandle(ProcessTokenHandle);
 			}
+
+			TryGetProcessCommandLine(Process.Handle, Process.CommandLine, _countof(Process.CommandLine));
 		}
 
 		if(FilterByUserName && lstrcmpi(Process.UserName, FilterUserName) != 0) {
@@ -1108,6 +1253,25 @@ static void RestoreConsole(void)
 	SetConsoleActiveScreenBuffer(OldConsoleHandle);
 }
 
+static const TCHAR *SkipDisplayChars(const TCHAR *String, DWORD Count)
+{
+	while(Count > 0 && *String != _T('\0')) {
+		++String;
+		--Count;
+	}
+
+	return String;
+}
+
+static const TCHAR *GetProcessDisplayName(const process *Process)
+{
+	if(ShowFullCommandLine && Process->CommandLine[0] != _T('\0')) {
+		return Process->CommandLine;
+	}
+
+	return Process->ExeName;
+}
+
 static void WriteProcessInfo(const process *Process, BOOL Highlighted)
 {
 	WORD Color = Config.FGColor;
@@ -1129,6 +1293,8 @@ static void WriteProcessInfo(const process *Process, BOOL Highlighted)
 
 	TCHAR MemoryStr[256];
 	FormatMemoryString(MemoryStr, _countof(MemoryStr), Process->UsedMemory);
+
+	const TCHAR *DisplayProcessName = SkipDisplayChars(GetProcessDisplayName(Process), HorizontalScrollOffset);
 
 	if(ProcessSortType == SORT_BY_TREE) {
 		TCHAR OffsetStr[256] = { 0 };
@@ -1158,7 +1324,7 @@ static void WriteProcessInfo(const process *Process, BOOL Highlighted)
 		CharsWritten += ConPrintf(_T("  %s"), OffsetStr);
 		SetColor(Color);
 
-		CharsWritten += ConPrintf(_T("%s"), Process->ExeName);
+		CharsWritten += ConPrintf(_T("%s"), DisplayProcessName);
 	} else {
 		CharsWritten = ConPrintf(_T("\n%7u  %9s  %3u  %04.1f%%  %s  %4u  % 03.1f MB/s  %s  %s"),
 				Process->ID,
@@ -1169,13 +1335,28 @@ static void WriteProcessInfo(const process *Process, BOOL Highlighted)
 				Process->ThreadCount,
 				ceil((double)Process->DiskUsage / 1000000.0 * 10.0) / 10.0,
 				UpTimeStr,
-				Process->ExeName
+				DisplayProcessName
 				);
 	}
 
 	if (InteractiveMode) {
-		ConPrintf(_T("%*c"), Width-CharsWritten+1, _T(' '));
+		int FillSize = Width - CharsWritten + 1;
+		if(FillSize > 0) {
+			ConPrintf(_T("%*c"), FillSize, _T(' '));
+		}
 	}
+}
+
+static BOOL CanScrollRight(void)
+{
+	if(ProcessCount == 0 || SelectedProcessIndex >= ProcessCount) {
+		return FALSE;
+	}
+
+	const TCHAR *SelectedName = GetProcessDisplayName(&ProcessList[SelectedProcessIndex]);
+	DWORD NameLength = (DWORD)_tcslen(SelectedName);
+
+	return NameLength > HorizontalScrollOffset;
 }
 
 static ULONGLONG KeyPressStart = 0;
@@ -1330,6 +1511,8 @@ static void PrintHelp(const TCHAR *argv0)
 	const help_entry InteractiveCommands[] = {
 		{ _T("Up and Down Arrows, PgUp and PgDown, j and k\n"), _T("\tScroll through the process list.") },
 		{ _T("CTRL + Left and Right Arrows\n"), _T("\tChange the process sort column.") },
+		{ _T("Left and Right Arrows"), _T("\tScroll process command line horizontally when full command line display is enabled.") },
+		{ _T("c"), _T("Toggle full process command line display.") },
 		{ _T("g"), _T("Go to the top of the process list.") },
 		{ _T("G"), _T("Go to the bottom of the process list.") },
 		{ _T("Space"), _T("Tag or untag selected process.") },
@@ -1537,6 +1720,9 @@ static void ProcessInput(BOOL *Redraw)
 							}
 							ChangeProcessSortType(ProcessSortType);
 							*Redraw = TRUE;
+						} else if(ShowFullCommandLine && HorizontalScrollOffset > 0) {
+							--HorizontalScrollOffset;
+							*Redraw = TRUE;
 						}
 						break;
 					case VK_RIGHT:
@@ -1547,6 +1733,9 @@ static void ProcessInput(BOOL *Redraw)
 								++ProcessSortType;
 							}
 							ChangeProcessSortType(ProcessSortType);
+							*Redraw = TRUE;
+						} else if(ShowFullCommandLine && CanScrollRight()) {
+							++HorizontalScrollOffset;
 							*Redraw = TRUE;
 						}
 						break;
@@ -1603,6 +1792,13 @@ static void ProcessInput(BOOL *Redraw)
 							break;
 						case 'N':
 							SearchPrevious();
+							*Redraw = TRUE;
+							break;
+						case 'c':
+							ShowFullCommandLine = !ShowFullCommandLine;
+							if(!ShowFullCommandLine) {
+								HorizontalScrollOffset = 0;
+							}
 							*Redraw = TRUE;
 							break;
 						case 'j':

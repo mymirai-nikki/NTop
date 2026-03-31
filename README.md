@@ -56,6 +56,8 @@ $ winget install gsass1.NTop
 | <kbd>K</kbd> | Kill all tagged processes. |
 | <kbd>I</kbd> | Invert the sort order. |
 | <kbd>F</kbd> | Follow process: if the sort order causes the currently selected process to move in the list, make the selection bar follow it. Moving the cursor manually automatically disables this feature. |
+| <kbd>c</kbd> | Toggle full process command line display. |
+| <kbd>Left</kbd>/<kbd>Right</kbd> | Scroll process command line horizontally (only when full command line display is enabled). |
 | <kbd>n</kbd> | Next in search. |
 | <kbd>N</kbd> | Previous in search. |
 
